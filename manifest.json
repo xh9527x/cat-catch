@@ -8,7 +8,7 @@
     "default_popup": "popup.html"
   },
   "side_panel": {
-    "default_path": "sidepanel.html"
+    "default_path": "popup.html"
   },
   "description": "嗅探猫 Dev / Cat Catch Dev with Global SidePanel Projector + Floating Projector Button",
   "icons": {

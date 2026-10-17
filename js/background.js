@@ -595,12 +595,17 @@ chrome.runtime.onMessage.addListener(function (Message, sender, sendResponse) {
     if (Message.Message == "projector-open-from-tab") {
         const tabId = sender?.tab?.id || Message.tabId;
         const list = projectorGetFloatCandidates(tabId);
+        // v11-单播放器：老会话的源 tab 恢复为列表
+        const prevSourceTabId = projectorIsActive() ? Number(G.ProjectorSession.sourceTabId) : 0;
         const session = projectorCreateSession(tabId, sender?.tab?.windowId, list, "", 0, sender?.tab);
         if (!session) {
             sendResponse({ ok: false, error: "当前页面没有可投影资源" });
             return true;
         }
         projectorSaveSession(session);
+        if (prevSourceTabId && prevSourceTabId !== tabId) {
+            try { chrome.sidePanel.setOptions({ tabId: prevSourceTabId, path: "popup.html?tabId=" + prevSourceTabId }); } catch (e) {}
+        }
         projectorOpenSidePanel(tabId, function (err) {
             if (err) {
                 sendResponse({ ok: false, error: err });
@@ -617,6 +622,8 @@ chrome.runtime.onMessage.addListener(function (Message, sender, sendResponse) {
             ? snapList.map(function (d) { return CatCatchProjectorCommon.cloneProjectorItem(d); })
                 .filter(function (d) { return CatCatchProjectorCommon.isProjectorPlayable(d); })
             : projectorGetCandidates(sourceTabId);
+        // v11-单播放器：老会话的源 tab 恢复为列表（唯一播放器搬到新源 tab）
+        const prevSourceTabId = projectorIsActive() ? Number(G.ProjectorSession.sourceTabId) : 0;
         const session = projectorCreateSession(
             sourceTabId, Message.windowId || 0, list,
             Message.snapshot?.selectedRequestId || "", Number(Message.snapshot?.selectedIndex || 0),
@@ -626,18 +633,15 @@ chrome.runtime.onMessage.addListener(function (Message, sender, sendResponse) {
             return true;
         }
         projectorSaveSession(session);
-        // v11-fix: 上游 tabs.onUpdated 会按 tab 把侧边栏路径重置为 popup.html（列表页）。
+        if (prevSourceTabId && prevSourceTabId !== sourceTabId) {
+            try { chrome.sidePanel.setOptions({ tabId: prevSourceTabId, path: "popup.html?tabId=" + prevSourceTabId }); } catch (e) {}
+        }
+        // 上游 tabs.onUpdated 会按 tab 把侧边栏路径重置为 popup.html（列表页）。
         // 投影打开时必须先把该 tab 的侧边栏固定为 sidepanel.html（播放器）再打开，否则侧边栏显示的是列表。
         try {
             chrome.sidePanel.setOptions({ tabId: sourceTabId, path: "sidepanel.html" });
             chrome.sidePanel.open({ tabId: sourceTabId });
         } catch (e) { /* 忽略，popup 端会兜底打开 */ }
-        projectorPinAllPanelsToPlayer();
-        // v11-fix: 已有播放器实例在播旧会话时，新会话必须广播出去，
-        // 否则老实例收不到通知、点的资源播不出来（setOptions 同路径不触发文档重载）
-        try {
-            chrome.runtime.sendMessage({ Message: "projector-new-session", sessionId: session.sessionId });
-        } catch (e) {}
         sendResponse({ ok: true, sessionId: session.sessionId, count: list.length });
         return true;
     }
@@ -661,26 +665,9 @@ chrome.runtime.onMessage.addListener(function (Message, sender, sendResponse) {
     }
     if (Message.Message == "projector-close-session") {
         G.ProjectorSession = { active: false, sessionId: "" };
-        G.ProjectorPanel = null;
         projectorPersistSession();
-        // v11-fix: 会话结束，把所有 tab 的侧边栏恢复为列表页
+        // 会话结束，把所有 tab 的侧边栏恢复为列表页
         projectorRestoreAllPanelsToList();
-        sendResponse({ ok: true });
-        return true;
-    }
-    // v11-fix: panel 实例播放权仲裁 —— 每个 sidepanel.html 文档实例唯一 panelId，
-    // 同一时间只允许一个实例持有播放权；后来者广播 standby，前任释放 <video>。
-    if (Message.Message == "projector-panel-claim") {
-        const panelId = String(Message.panelId || "");
-        const sessionId = String(Message.sessionId || "");
-        if (!panelId || !projectorIsActive() || sessionId !== G.ProjectorSession.sessionId) {
-            sendResponse({ ok: false });
-            return true;
-        }
-        G.ProjectorPanel = { panelId: panelId, sessionId: sessionId, updatedAt: Date.now() };
-        try {
-            chrome.runtime.sendMessage({ Message: "projector-panel-standby", panelId: panelId, sessionId: sessionId });
-        } catch (e) {}
         sendResponse({ ok: true });
         return true;
     }
@@ -767,8 +754,9 @@ chrome.tabs.onUpdated.addListener(function (tabId, changeInfo, tab) {
             G.damnUrlSet.add(tabId);
         }
     }
-    if (projectorIsActive()) {
-        // v11-fix: 投影会话存续期间，侧边栏固定为播放器，不重置为列表页（v10 行为：全局投影时侧边栏即播放器）
+    // v11-单播放器：只有会话源 tab 的侧边栏是播放器，其余永远是列表。
+    // 切标签不再"自动刷新"出播放器（侧边浏览器模型）。
+    if (projectorIsActive() && tabId === Number(G.ProjectorSession.sourceTabId)) {
         chrome.sidePanel.setOptions({ tabId, path: "sidepanel.html" });
     } else {
         chrome.sidePanel.setOptions({
@@ -857,8 +845,20 @@ chrome.tabs.onRemoved.addListener(function (tabId) {
         G.blockUrlSet.has(tabId) && G.blockUrlSet.delete(tabId);
         G.damnUrlSet.has(tabId) && G.damnUrlSet.delete(tabId);
     }
-    // v11-方案二：会话与源 tab 生命周期解耦 —— 源 tab 关闭不再结束会话、不再重置 panel 路径。
-    // 播放器拿到 URL 后独立播放；会话只由显式"停止投影"或新会话覆盖来结束。
+    // v11-单播放器：源 tab 关闭 → 播放器搬到当前活动 tab，会话不断、继续播
+    // （侧边浏览器不随网页标签页关闭而消失；显式"停止投影"或新会话覆盖才结束）。
+    if (projectorIsActive() && Number(G.ProjectorSession.sourceTabId) === tabId) {
+        chrome.tabs.query({ active: true, currentWindow: true }, function (tabs) {
+            var t = tabs && tabs[0];
+            if (t && t.id > 0 && t.id !== tabId) {
+                G.ProjectorSession.sourceTabId = t.id;
+                projectorPersistSession();
+                try { chrome.sidePanel.setOptions({ tabId: t.id, path: "sidepanel.html" }); } catch (e) {}
+            } else {
+                projectorSaveSession({ active: false, sessionId: "" });
+            }
+        });
+    }
     projectorNotifyDebounce.delete(tabId);
 });
 
@@ -1219,25 +1219,10 @@ function clearRedundant() {
  * ===================================================================== */
 const PROJECTOR_SESSION_KEY = "CatCatchProjectorSession";
 
-// v11-fix: 真单例仲裁 —— 当前持有播放权的 panel 文档实例。{ panelId, sessionId, updatedAt }
-// Chrome 侧边栏按 tab 独立文档实例，各实例独立 <video>；同一时间只允许一个实例播放，其余待命。
-G.ProjectorPanel = null;
-
+// v11-单播放器：播放器只活在点了"投影"的源标签页（侧边浏览器模型），
+// 同一时间只存在一个播放器文档，无需多实例仲裁。
 function projectorIsActive() {
     return !!(G && G.ProjectorSession && G.ProjectorSession.active && G.ProjectorSession.sessionId);
-}
-
-// v11-fix: 会话开始时，把所有现存 tab 的侧边栏统一固定为播放器，消除历史 popup.html 覆盖残留
-function projectorPinAllPanelsToPlayer() {
-    try {
-        chrome.tabs.query({}, function (tabs) {
-            (tabs || []).forEach(function (t) {
-                if (t && t.id > 0) {
-                    try { chrome.sidePanel.setOptions({ tabId: t.id, path: "sidepanel.html" }); } catch (e) {}
-                }
-            });
-        });
-    } catch (e) {}
 }
 
 // v11-fix: 会话结束时，把所有 tab 的侧边栏恢复为列表页
@@ -1301,20 +1286,14 @@ function projectorCreateSession(sourceTabId, sourceWindowId, list, selectedReque
 }
 
 function projectorOpenSidePanel(tabId, cb) {
-    chrome.sidePanel.setOptions({ path: "sidepanel.html", enabled: true }, function () {
+    // v11-单播放器：只把来源 tab 的侧边栏设为播放器
+    try { chrome.sidePanel.setOptions({ tabId: tabId, path: "sidepanel.html" }); } catch (e) {}
+    chrome.sidePanel.open({ tabId: tabId }, function () {
         if (chrome.runtime.lastError) {
             cb && cb(chrome.runtime.lastError.message);
             return;
         }
-        // v11-fix: 悬浮按钮路径同样统一所有 tab，避免存量 popup.html 覆盖导致切 tab 时忽列表忽播放器
-        projectorPinAllPanelsToPlayer();
-        chrome.sidePanel.open({ tabId: tabId }, function () {
-            if (chrome.runtime.lastError) {
-                cb && cb(chrome.runtime.lastError.message);
-                return;
-            }
-            cb && cb();
-        });
+        cb && cb();
     });
 }
 
