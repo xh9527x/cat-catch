@@ -633,6 +633,11 @@ chrome.runtime.onMessage.addListener(function (Message, sender, sendResponse) {
             chrome.sidePanel.open({ tabId: sourceTabId });
         } catch (e) { /* 忽略，popup 端会兜底打开 */ }
         projectorPinAllPanelsToPlayer();
+        // v11-fix: 已有播放器实例在播旧会话时，新会话必须广播出去，
+        // 否则老实例收不到通知、点的资源播不出来（setOptions 同路径不触发文档重载）
+        try {
+            chrome.runtime.sendMessage({ Message: "projector-new-session", sessionId: session.sessionId });
+        } catch (e) {}
         sendResponse({ ok: true, sessionId: session.sessionId, count: list.length });
         return true;
     }

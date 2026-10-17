@@ -188,6 +188,39 @@
         }
     }
 
+    // v11-fix: 把按钮钳制在可视区内 —— 保存的位置可能来自更大的窗口，
+    // 直接恢复会导致按钮超出屏幕、点不到
+    function clampToViewport() {
+        if (!alive || !btn || btn.style.display === 'none') {
+            return;
+        }
+        var rect = btn.getBoundingClientRect();
+        var x = Math.max(0, Math.min(window.innerWidth - rect.width, rect.left));
+        var y = Math.max(0, Math.min(window.innerHeight - rect.height, rect.top));
+        btn.style.left = x + 'px';
+        btn.style.top = y + 'px';
+        btn.style.right = 'auto';
+    }
+
+    // 恢复保存位置时按钮还是 display:none（量不到尺寸），临时显示一下再钳制
+    function restorePosition(pos) {
+        if (!alive || !btn) {
+            return;
+        }
+        var prevDisplay = btn.style.display;
+        btn.style.visibility = 'hidden';
+        btn.style.display = 'flex';
+        var w = btn.offsetWidth || 100;
+        var h = btn.offsetHeight || 34;
+        btn.style.display = prevDisplay;
+        btn.style.visibility = '';
+        var x = Math.max(0, Math.min(window.innerWidth - w, pos.x));
+        var y = Math.max(0, Math.min(window.innerHeight - h, pos.y));
+        btn.style.left = x + 'px';
+        btn.style.top = y + 'px';
+        btn.style.right = 'auto';
+    }
+
     function create() {
         if (!alive || !hasExtensionContext()) {
             cleanup();
@@ -248,9 +281,7 @@
             }
             var pos = response && response[POS_KEY];
             if (pos && Number.isFinite(pos.x) && Number.isFinite(pos.y)) {
-                btn.style.left = pos.x + 'px';
-                btn.style.top = pos.y + 'px';
-                btn.style.right = 'auto';
+                restorePosition(pos);
             }
         });
 
@@ -336,6 +367,11 @@
                 refresh();
             }
         });
+
+        // v11-fix: 窗口缩放/缩放比例变化时把按钮拉回可视区
+        addListener(window, 'resize', function () {
+            clampToViewport();
+        });
     }
 
     function refresh() {
@@ -354,6 +390,7 @@
             var badge = btn.querySelector('.badge');
             if (count > 0) {
                 btn.style.display = 'flex';
+                clampToViewport();
                 if (count > 1) {
                     badge.textContent = String(count);
                     badge.style.display = 'inline-block';

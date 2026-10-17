@@ -313,6 +313,24 @@
             String(m.panelId) !== panelId) {
             standby();
         }
+        // v11-fix: 新会话广播 —— 用户在别处点了别的资源的投影，直接切到新会话换播
+        if (m && m.Message === 'projector-new-session') {
+            var nid = String(m.sessionId || '');
+            if (nid && (!session || String(session.sessionId) !== nid)) {
+                chrome.runtime.sendMessage({ Message: 'projector-get-session' }, function (r) {
+                    if (chrome.runtime.lastError) {
+                        return;
+                    }
+                    var s = r && r.session;
+                    if (s && s.active && String(s.sessionId) === nid) {
+                        isStandby = false;
+                        clearTimeout(standbyTimer);
+                        standbyTimer = null;
+                        init(s);
+                    }
+                });
+            }
+        }
     });
 
     // v11-方案二：文档被缓存复用（如切回旧 tab）时重新接管；可见才播，不可见不抢
@@ -339,6 +357,12 @@
                     clearTimeout(standbyTimer);
                     destroy();
                     msg('投影会话已结束');
+                } else if (s && s.active) {
+                    // v11-fix: 会话已换新（广播没收到时兜底）：跟进新会话
+                    isStandby = false;
+                    clearTimeout(standbyTimer);
+                    standbyTimer = null;
+                    init(s);
                 }
             });
         }
