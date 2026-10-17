@@ -4,7 +4,7 @@
  * firefox 在 manifest 文件中已经加载以下脚本，如果已经加载 G 变量存在，不再加载。
  */
 if (typeof G === 'undefined') {
-    importScripts("/js/polyfill.js", "/js/function.js", "/js/templates.js", "/js/init.js");
+    importScripts("/js/polyfill.js", "/js/function.js", "/js/templates.js", "/js/init.js", "/js/projector-common.js");
 }
 
 // Service Worker 5分钟后会强制终止扩展
@@ -12,18 +12,20 @@ if (typeof G === 'undefined') {
 // https://stackoverflow.com/questions/66618136/persistent-service-worker-in-chrome-extension/70003493#70003493
 chrome.webNavigation.onBeforeNavigate.addListener(function () { return; });
 chrome.webNavigation.onHistoryStateUpdated.addListener(function () { return; });
+// Projector v11: BFCache 修复。页面进入往返缓存时 Chrome 会断开扩展端口，
+// 此处只消费 disconnect 的 lastError，不再 postMessage / 定时 disconnect，
+// 避免产生扩展错误角标。keep-alive 定时器保留（上游行为）。
 chrome.runtime.onConnect.addListener(function (Port) {
-    if (chrome.runtime.lastError || Port.name !== "HeartBeat") return;
-    Port.postMessage("HeartBeat");
-    Port.onMessage.addListener(function (message, Port) { return; });
-    const interval = setInterval(function () {
-        clearInterval(interval);
-        Port.disconnect();
-    }, 250000);
-    Port.onDisconnect.addListener(function () {
-        interval && clearInterval(interval);
-        if (chrome.runtime.lastError) { return; }
-    });
+    if (!Port || Port.name !== "HeartBeat") { return; }
+    try {
+        Port.onDisconnect.addListener(function () {
+            try {
+                if (chrome.runtime && chrome.runtime.lastError) {
+                    const _ = chrome.runtime.lastError.message;
+                }
+            } catch (e) {}
+        });
+    } catch (e) {}
 });
 setInterval(chrome.runtime.getPlatformInfo, 25 * 1000);
 
@@ -333,6 +335,8 @@ function save(tabId) {
             });
         }
         SetIcon({ number: cacheData[tabId].length, tabId: tabId });
+        // Projector v11: 通知页面悬浮按钮刷新（防抖，替代高频轮询）
+        projectorNotifyCandidatesChanged(tabId);
     }
 }
 
@@ -582,6 +586,73 @@ chrome.runtime.onMessage.addListener(function (Message, sender, sendResponse) {
         sendResponse("ok");
         return true;
     }
+    // ============ Projector 投影播放器（dev 定制 v11） ============
+    if (Message.Message == "projector-get-candidates-count") {
+        const tabId = sender?.tab?.id || Message.tabId;
+        sendResponse({ ok: true, count: projectorGetFloatCandidates(tabId).length });
+        return true;
+    }
+    if (Message.Message == "projector-open-from-tab") {
+        const tabId = sender?.tab?.id || Message.tabId;
+        const list = projectorGetFloatCandidates(tabId);
+        const session = projectorCreateSession(tabId, sender?.tab?.windowId, list, "", 0, sender?.tab);
+        if (!session) {
+            sendResponse({ ok: false, error: "当前页面没有可投影资源" });
+            return true;
+        }
+        projectorSaveSession(session);
+        projectorOpenSidePanel(tabId, function (err) {
+            if (err) {
+                sendResponse({ ok: false, error: err });
+                return;
+            }
+            sendResponse({ ok: true, sessionId: session.sessionId, count: list.length });
+        });
+        return true;
+    }
+    if (Message.Message == "projector-open-session") {
+        const sourceTabId = Number(Message.snapshot?.sourceTabId || Message.tabId || G.tabId);
+        const snapList = Array.isArray(Message.snapshot?.list) ? Message.snapshot.list : null;
+        const list = snapList
+            ? snapList.map(function (d) { return CatCatchProjectorCommon.cloneProjectorItem(d); })
+                .filter(function (d) { return CatCatchProjectorCommon.isProjectorPlayable(d); })
+            : projectorGetCandidates(sourceTabId);
+        const session = projectorCreateSession(
+            sourceTabId, Message.windowId || 0, list,
+            Message.snapshot?.selectedRequestId || "", Number(Message.snapshot?.selectedIndex || 0),
+            { title: Message.snapshot?.pageTitle, url: Message.snapshot?.pageUrl });
+        if (!session) {
+            sendResponse({ ok: false, error: "没有可投影资源" });
+            return true;
+        }
+        projectorSaveSession(session);
+        sendResponse({ ok: true, sessionId: session.sessionId, count: list.length });
+        return true;
+    }
+    if (Message.Message == "projector-get-session") {
+        sendResponse({ ok: true, session: G.ProjectorSession || null });
+        return true;
+    }
+    if (Message.Message == "projector-update-playback") {
+        if (projectorIsActive() && Message.sessionId == G.ProjectorSession.sessionId) {
+            G.ProjectorSession.playback = {
+                ...(G.ProjectorSession.playback || {}),
+                ...(Message.playback || {}),
+                updatedAt: Date.now()
+            };
+            projectorPersistSession();
+            sendResponse({ ok: true });
+            return true;
+        }
+        sendResponse({ ok: false });
+        return true;
+    }
+    if (Message.Message == "projector-close-session") {
+        G.ProjectorSession = { active: false, sessionId: "" };
+        projectorPersistSession();
+        sendResponse({ ok: true });
+        return true;
+    }
 });
 
 /**
@@ -750,6 +821,11 @@ chrome.tabs.onRemoved.addListener(function (tabId) {
         G.blockUrlSet.has(tabId) && G.blockUrlSet.delete(tabId);
         G.damnUrlSet.has(tabId) && G.damnUrlSet.delete(tabId);
     }
+    // Projector: 来源 tab 关闭时结束投影会话
+    if (projectorIsActive() && G.ProjectorSession.sourceTabId == tabId) {
+        projectorSaveSession({ active: false, sessionId: "" });
+    }
+    projectorNotifyDebounce.delete(tabId);
 });
 
 // 右键菜单 和 快捷键 复用函数
@@ -1103,22 +1179,102 @@ function clearRedundant() {
     });
 }
 
-// 扩展升级，清空本地储存
-chrome.runtime.onInstalled.addListener(function (details) {
-    if (details.reason == "update") {
-        chrome.storage.local.clear(function () {
-            if (chrome.storage.session) {
-                chrome.storage.session.clear(InitOptions);
-            } else {
-                InitOptions();
+/* =====================================================================
+ * Projector 投影播放器（dev 定制 v11）
+ * 公共判据/排序/克隆见 js/projector-common.js（CatCatchProjectorCommon）。
+ * ===================================================================== */
+const PROJECTOR_SESSION_KEY = "CatCatchProjectorSession";
+
+function projectorIsActive() {
+    return !!(G && G.ProjectorSession && G.ProjectorSession.active && G.ProjectorSession.sessionId);
+}
+
+function projectorPersistSession() {
+    (chrome.storage.session ?? chrome.storage.local).set({ [PROJECTOR_SESSION_KEY]: G.ProjectorSession });
+}
+
+function projectorSaveSession(s) {
+    G.ProjectorSession = s || { active: false, sessionId: "" };
+    projectorPersistSession();
+}
+
+/** 某 tab 的全部可投影候选（去重+排序） */
+function projectorGetCandidates(tabId) {
+    return CatCatchProjectorCommon.sortProjectorCandidates(cacheData[tabId] || [], false);
+}
+
+/** 悬浮按钮用候选（排除切片类 URL） */
+function projectorGetFloatCandidates(tabId) {
+    return CatCatchProjectorCommon.sortProjectorCandidates(cacheData[tabId] || [], true);
+}
+
+function projectorCreateSession(sourceTabId, sourceWindowId, list, selectedRequestId, selectedIndex, sourceInfo) {
+    if (!list.length) {
+        return null;
+    }
+    if (selectedRequestId) {
+        const found = list.findIndex(function (x) { return String(x.requestId) === String(selectedRequestId); });
+        if (found >= 0) {
+            selectedIndex = found;
+        }
+    }
+    selectedIndex = Math.max(0, Math.min(list.length - 1, Number(selectedIndex || 0)));
+    const selected = list[selectedIndex] || {};
+    const sessionId = Date.now().toString() + "-" + Math.random().toString(16).slice(2);
+    return {
+        active: true,
+        sessionId: sessionId,
+        sourceTabId: sourceTabId,
+        sourceWindowId: sourceWindowId,
+        selectedRequestId: selectedRequestId || selected.requestId || "",
+        selectedIndex: selectedIndex,
+        list: list,
+        pageTitle: sourceInfo?.title || selected.title || selected._title || "",
+        pageUrl: sourceInfo?.url || selected.webUrl || "",
+        playback: { currentTime: 0, selectedIndex: selectedIndex, paused: false, updatedAt: Date.now() },
+        createdAt: Date.now()
+    };
+}
+
+function projectorOpenSidePanel(tabId, cb) {
+    chrome.sidePanel.setOptions({ path: "sidepanel.html", enabled: true }, function () {
+        if (chrome.runtime.lastError) {
+            cb && cb(chrome.runtime.lastError.message);
+            return;
+        }
+        chrome.sidePanel.open({ tabId: tabId }, function () {
+            if (chrome.runtime.lastError) {
+                cb && cb(chrome.runtime.lastError.message);
+                return;
+            }
+            cb && cb();
+        });
+    });
+}
+
+// v11: 新资源存入时 push 通知对应页面的悬浮按钮（按 tab 防抖 2s），
+// 悬浮按钮收到后立即刷新计数，不再依赖高频轮询。
+const projectorNotifyDebounce = new Map();
+function projectorNotifyCandidatesChanged(tabId) {
+    if (!tabId || tabId <= 0) {
+        return;
+    }
+    const now = Date.now();
+    if (now - (projectorNotifyDebounce.get(tabId) || 0) < 2000) {
+        return;
+    }
+    projectorNotifyDebounce.set(tabId, now);
+    try {
+        chrome.tabs.sendMessage(tabId, { Message: "projector-candidates-changed" }, function () {
+            if (chrome.runtime.lastError) {
+                /* 页面无监听时忽略 */
             }
         });
-        chrome.alarms.create("nowClear", { when: Date.now() + 3000 });
-    }
-    if (details.reason == "install") {
-        chrome.tabs.create({ url: "install.html" });
-    }
-});
+    } catch (e) {}
+}
+
+// dev 定制：移除上游「扩展升级清空本地储存」逻辑，升级保留数据与投影会话。
+// 安装页由 install.html（自动关闭 stub）处理，此处不再注册 onInstalled。
 
 // 测试
 // chrome.storage.local.get(function (data) { console.log("storageLocal", data.MediaData) });
