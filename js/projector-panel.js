@@ -20,6 +20,9 @@
     var hlsInstance = null;
     var msgTimer = null;
     var lastSoft = '';
+    // v11-fix: 真单例仲裁 —— 每个 panel 文档实例唯一 id；同一时间只允许一个实例持有播放权
+    var panelId = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    var isStandby = false;
 
     function msg(text, ms) {
         clearTimeout(msgTimer);
@@ -34,7 +37,7 @@
     }
 
     function save() {
-        if (!session || !session.sessionId) {
+        if (isStandby || !session || !session.sessionId) {
             return;
         }
         chrome.runtime.sendMessage({
@@ -188,6 +191,30 @@
         });
     }
 
+    // v11-fix: 向 background 声明播放权；后来者会广播 standby 让前任释放 <video>
+    function claim() {
+        if (!session || !session.sessionId) {
+            return;
+        }
+        isStandby = false;
+        try {
+            chrome.runtime.sendMessage({ Message: 'projector-panel-claim', panelId: panelId, sessionId: session.sessionId }, function () {
+                if (chrome.runtime.lastError) { /* 忽略 */ }
+            });
+        } catch (e) {}
+    }
+
+    // v11-fix: 让出播放权 —— 先上报当前位置保证接管方无缝续播，再释放播放器（幂等）
+    function standby() {
+        if (isStandby) {
+            return;
+        }
+        try { save(); } catch (e) {}
+        isStandby = true;
+        destroy();
+        msg('已在其他标签页接管播放', 2500);
+    }
+
     function init(s) {
         session = s;
         if (!s || !s.active || !Array.isArray(s.list) || !s.list.length) {
@@ -198,7 +225,37 @@
         currentIndex = Math.max(0, Math.min(mediaList.length - 1,
             Number(s.playback && s.playback.selectedIndex !== undefined ? s.playback.selectedIndex : (s.selectedIndex || 0))));
         play(currentIndex);
+        claim();
     }
+
+    // v11-fix: 仲裁广播 —— panelId 对不上的实例释放播放器（广播也会发给自己，id 一致则忽略）
+    chrome.runtime.onMessage.addListener(function (m) {
+        if (m && m.Message === 'projector-panel-standby' &&
+            String(m.sessionId) === String(session && session.sessionId) &&
+            String(m.panelId) !== panelId) {
+            standby();
+        }
+    });
+
+    // v11-fix: 文档被缓存复用（如切回旧 tab）时重新接管；可见才播，不可见不抢
+    document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'visible' && session && session.sessionId) {
+            chrome.runtime.sendMessage({ Message: 'projector-get-session' }, function (r) {
+                if (chrome.runtime.lastError) {
+                    return;
+                }
+                var s = r && r.session;
+                if (s && s.active && String(s.sessionId) === String(session.sessionId)) {
+                    session = s;
+                    if (isStandby) {
+                        init(s); // 待命过的实例：重新加载并从会话进度续播
+                    } else {
+                        claim(); // 断言播放权（幂等）
+                    }
+                }
+            });
+        }
+    });
 
     chrome.runtime.sendMessage({ Message: 'projector-get-session' }, function (r) {
         if (chrome.runtime.lastError) {
@@ -207,4 +264,11 @@
         }
         init(r && r.session);
     });
+
+    // v11-fix: 心跳重声明 —— SW 重启会丢失 G.ProjectorPanel，存活实例定期重申播放权以收敛单例
+    setInterval(function () {
+        if (!isStandby && session && session.sessionId && !video.paused && document.visibilityState === 'visible') {
+            claim();
+        }
+    }, 30000);
 })();

@@ -632,6 +632,7 @@ chrome.runtime.onMessage.addListener(function (Message, sender, sendResponse) {
             chrome.sidePanel.setOptions({ tabId: sourceTabId, path: "sidepanel.html" });
             chrome.sidePanel.open({ tabId: sourceTabId });
         } catch (e) { /* 忽略，popup 端会兜底打开 */ }
+        projectorPinAllPanelsToPlayer();
         sendResponse({ ok: true, sessionId: session.sessionId, count: list.length });
         return true;
     }
@@ -654,13 +655,27 @@ chrome.runtime.onMessage.addListener(function (Message, sender, sendResponse) {
         return true;
     }
     if (Message.Message == "projector-close-session") {
-        const srcTabId = Number(G.ProjectorSession && G.ProjectorSession.sourceTabId) || 0;
         G.ProjectorSession = { active: false, sessionId: "" };
+        G.ProjectorPanel = null;
         projectorPersistSession();
-        // v11-fix: 会话结束，把来源 tab 的侧边栏恢复为列表页
-        if (srcTabId > 0) {
-            try { chrome.sidePanel.setOptions({ tabId: srcTabId, path: "popup.html?tabId=" + srcTabId }); } catch (e) {}
+        // v11-fix: 会话结束，把所有 tab 的侧边栏恢复为列表页
+        projectorRestoreAllPanelsToList();
+        sendResponse({ ok: true });
+        return true;
+    }
+    // v11-fix: panel 实例播放权仲裁 —— 每个 sidepanel.html 文档实例唯一 panelId，
+    // 同一时间只允许一个实例持有播放权；后来者广播 standby，前任释放 <video>。
+    if (Message.Message == "projector-panel-claim") {
+        const panelId = String(Message.panelId || "");
+        const sessionId = String(Message.sessionId || "");
+        if (!panelId || !projectorIsActive() || sessionId !== G.ProjectorSession.sessionId) {
+            sendResponse({ ok: false });
+            return true;
         }
+        G.ProjectorPanel = { panelId: panelId, sessionId: sessionId, updatedAt: Date.now() };
+        try {
+            chrome.runtime.sendMessage({ Message: "projector-panel-standby", panelId: panelId, sessionId: sessionId });
+        } catch (e) {}
         sendResponse({ ok: true });
         return true;
     }
@@ -840,6 +855,8 @@ chrome.tabs.onRemoved.addListener(function (tabId) {
     // Projector: 来源 tab 关闭时结束投影会话
     if (projectorIsActive() && G.ProjectorSession.sourceTabId == tabId) {
         projectorSaveSession({ active: false, sessionId: "" });
+        G.ProjectorPanel = null;
+        projectorRestoreAllPanelsToList();
     }
     projectorNotifyDebounce.delete(tabId);
 });
@@ -1201,8 +1218,38 @@ function clearRedundant() {
  * ===================================================================== */
 const PROJECTOR_SESSION_KEY = "CatCatchProjectorSession";
 
+// v11-fix: 真单例仲裁 —— 当前持有播放权的 panel 文档实例。{ panelId, sessionId, updatedAt }
+// Chrome 侧边栏按 tab 独立文档实例，各实例独立 <video>；同一时间只允许一个实例播放，其余待命。
+G.ProjectorPanel = null;
+
 function projectorIsActive() {
     return !!(G && G.ProjectorSession && G.ProjectorSession.active && G.ProjectorSession.sessionId);
+}
+
+// v11-fix: 会话开始时，把所有现存 tab 的侧边栏统一固定为播放器，消除历史 popup.html 覆盖残留
+function projectorPinAllPanelsToPlayer() {
+    try {
+        chrome.tabs.query({}, function (tabs) {
+            (tabs || []).forEach(function (t) {
+                if (t && t.id > 0) {
+                    try { chrome.sidePanel.setOptions({ tabId: t.id, path: "sidepanel.html" }); } catch (e) {}
+                }
+            });
+        });
+    } catch (e) {}
+}
+
+// v11-fix: 会话结束时，把所有 tab 的侧边栏恢复为列表页
+function projectorRestoreAllPanelsToList() {
+    try {
+        chrome.tabs.query({}, function (tabs) {
+            (tabs || []).forEach(function (t) {
+                if (t && t.id > 0) {
+                    try { chrome.sidePanel.setOptions({ tabId: t.id, path: "popup.html?tabId=" + t.id }); } catch (e) {}
+                }
+            });
+        });
+    } catch (e) {}
 }
 
 function projectorPersistSession() {
@@ -1258,6 +1305,8 @@ function projectorOpenSidePanel(tabId, cb) {
             cb && cb(chrome.runtime.lastError.message);
             return;
         }
+        // v11-fix: 悬浮按钮路径同样统一所有 tab，避免存量 popup.html 覆盖导致切 tab 时忽列表忽播放器
+        projectorPinAllPanelsToPlayer();
         chrome.sidePanel.open({ tabId: tabId }, function () {
             if (chrome.runtime.lastError) {
                 cb && cb(chrome.runtime.lastError.message);
