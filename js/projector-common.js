@@ -36,8 +36,8 @@
 
     /**
      * 是否可投影播放。覆盖 hls / dash / 常见音视频直链。
-     * 注意：ts 切片不算可投影；m4s 只有带明确音视频 MIME（如哔哩哔哩的 video/mp4）
-     * 时才给按钮（v10 行内按钮行为；v11 曾一刀切排除导致 B 站整页无按钮）。
+     * 注意：m4s / ts 切片不算可投影（单个切片无法正常播放，如哔哩哔哩；
+     * Wu 2026-10-17 定：B 站不需要显示投影按钮）。
      */
     function isProjectorPlayable(data) {
         if (!data || !data.url) {
@@ -45,12 +45,8 @@
         }
         var ext = str(data.ext);
         var type = str(data.type);
-        var isMediaType = type.indexOf('video/') === 0 || type.indexOf('audio/') === 0;
-        if (ext === 'ts') {
+        if (ext === 'm4s' || ext === 'ts') {
             return false;
-        }
-        if (ext === 'm4s') {
-            return isMediaType;
         }
         if (isM3u8(data) || isMpd(data)) {
             return true;
@@ -58,7 +54,7 @@
         if (['mp4', 'webm', 'mp3', 'wav', 'm4a', 'ogg', 'ogv', '3gp', 'mpeg', 'mov', 'aac'].indexOf(ext) !== -1) {
             return true;
         }
-        return isMediaType;
+        return type.indexOf('video/') === 0 || type.indexOf('audio/') === 0;
     }
 
     /** 悬浮按钮用的候选：可投影且排除切片类 URL */
