@@ -5,6 +5,7 @@ G.initLocalComplete = false;
 // 缓存数据
 var cacheData = { init: true };
 G.blockUrlSet = new Set();    // 屏蔽网址列表
+G.ProjectorSession = { active: false, sessionId: '' };   // Projector 全局投影会话（dev 定制）
 
 // 避免抓取列表
 G.damnUrl = [
@@ -168,7 +169,7 @@ G.OptionLists = {
 
     getHtmlDOM: false,  // 实验项 获取当前网页DOM
 
-    damn: false,    // 强制屏蔽网站开关
+    damn: true,    // 强制屏蔽网站开关（dev 定制：默认开启）
 
     iframeFFmpeg: false,    // 潜入在线ffmpeg
     contextMenus: false,    // 右键菜单
@@ -230,12 +231,16 @@ InitOptions();
 // 初始变量
 function InitOptions() {
     // 断开重新连接后 立刻把local里MediaData数据交给cacheData
-    (chrome.storage.session ?? chrome.storage.local).get({ MediaData: {} }, function (items) {
+    // Projector: 同时恢复持久化的投影会话（dev 定制）
+    (chrome.storage.session ?? chrome.storage.local).get({ MediaData: {}, CatCatchProjectorSession: null }, function (items) {
         if (items.MediaData.init) {
             cacheData = {};
-            return;
+        } else {
+            cacheData = items.MediaData;
         }
-        cacheData = items.MediaData;
+        if (items.CatCatchProjectorSession) {
+            G.ProjectorSession = items.CatCatchProjectorSession;
+        }
     });
     // 读取sync配置数据 交给全局变量G
     chrome.storage.sync.get(G.OptionLists, function (items) {
@@ -330,6 +335,11 @@ function InitOptions() {
 chrome.storage.onChanged.addListener(function (changes, namespace) {
     if (changes.MediaData) {
         if (changes.MediaData.newValue?.init) { cacheData = {}; }
+        return;
+    }
+    // Projector: 会话变更同步到 G（dev 定制）
+    if (changes.CatCatchProjectorSession) {
+        G.ProjectorSession = changes.CatCatchProjectorSession.newValue || { active: false, sessionId: '' };
         return;
     }
     for (let [key, { oldValue, newValue }] of Object.entries(changes)) {

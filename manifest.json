@@ -4,20 +4,21 @@
   },
   "action": {
     "default_icon": "img/icon.png",
-    "default_title": "__MSG_catCatch__",
+    "default_title": "嗅探猫 Dev - Projector",
     "default_popup": "popup.html"
   },
   "side_panel": {
-    "default_path": "popup.html"
+    "default_path": "sidepanel.html"
   },
-  "description": "__MSG_description__",
+  "description": "嗅探猫 Dev / Cat Catch Dev with Global SidePanel Projector + Floating Projector Button",
   "icons": {
     "64": "/img/icon.png",
     "128": "/img/icon128.png"
   },
   "manifest_version": 3,
-  "minimum_chrome_version": "93",
-  "name": "__MSG_catCatch__",
+  "minimum_chrome_version": "114",
+  "name": "嗅探猫 Dev - Projector",
+  "short_name": "猫抓Dev",
   "homepage_url": "https://github.com/xifangczy/cat-catch",
   "options_ui": {
     "page": "options.html",
@@ -73,13 +74,15 @@
         "http://*/*"
       ],
       "js": [
-        "js/content-script.js"
+        "js/content-script.js",
+        "js/projector-float.js"
       ],
       "run_at": "document_start",
       "all_frames": true
     }
   ],
   "default_locale": "en",
-  "version": "2.7.2",
+  "version": "2.7.2.1",
+  "version_name": "2.7.2-dev-projector-v11",
   "incognito": "split"
 }
