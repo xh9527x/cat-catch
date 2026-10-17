@@ -852,12 +852,8 @@ chrome.tabs.onRemoved.addListener(function (tabId) {
         G.blockUrlSet.has(tabId) && G.blockUrlSet.delete(tabId);
         G.damnUrlSet.has(tabId) && G.damnUrlSet.delete(tabId);
     }
-    // Projector: 来源 tab 关闭时结束投影会话
-    if (projectorIsActive() && G.ProjectorSession.sourceTabId == tabId) {
-        projectorSaveSession({ active: false, sessionId: "" });
-        G.ProjectorPanel = null;
-        projectorRestoreAllPanelsToList();
-    }
+    // v11-方案二：会话与源 tab 生命周期解耦 —— 源 tab 关闭不再结束会话、不再重置 panel 路径。
+    // 播放器拿到 URL 后独立播放；会话只由显式"停止投影"或新会话覆盖来结束。
     projectorNotifyDebounce.delete(tabId);
 });
 

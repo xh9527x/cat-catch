@@ -23,6 +23,7 @@
     // v11-fix: 真单例仲裁 —— 每个 panel 文档实例唯一 id；同一时间只允许一个实例持有播放权
     var panelId = Date.now().toString(36) + Math.random().toString(36).slice(2);
     var isStandby = false;
+    var standbyTimer = null;
 
     function msg(text, ms) {
         clearTimeout(msgTimer);
@@ -46,7 +47,10 @@
             playback: {
                 selectedIndex: currentIndex,
                 currentTime: Number.isFinite(video.currentTime) ? video.currentTime : 0,
-                paused: video.paused
+                paused: video.paused,
+                playbackRate: Number.isFinite(video.playbackRate) ? video.playbackRate : 1,
+                volume: Number.isFinite(video.volume) ? video.volume : 1,
+                muted: !!video.muted
             }
         }, function () {
             if (chrome.runtime.lastError) {
@@ -108,18 +112,54 @@
         cb();
     }
 
+    // v11-方案二：把会话里的播放状态（倍速/音量/静音）应用到 video 元素
+    // （倍速按钮文字由 controls.js 的 ratechange 监听自动同步）
+    function applyPlaybackState() {
+        var p = session && session.playback;
+        if (!p) {
+            return;
+        }
+        try {
+            if (Number.isFinite(Number(p.volume))) {
+                video.volume = Math.min(1, Math.max(0, Number(p.volume)));
+            }
+            if (typeof p.muted === 'boolean') {
+                video.muted = p.muted;
+            }
+            if (Number(p.playbackRate) > 0) {
+                video.playbackRate = Number(p.playbackRate);
+            }
+        } catch (e) {}
+    }
+
+    function seekToSavedPosition() {
+        var p = session && session.playback;
+        if (p && Number(p.currentTime) > 1) {
+            try {
+                video.currentTime = Math.max(0, Number(p.currentTime) - 0.8);
+            } catch (e) {}
+        }
+    }
+
+    // 会话记录是否为暂停态（恢复时用：暂停则不自动播）
+    function shouldResumePaused() {
+        var p = session && session.playback;
+        return !!(p && p.paused);
+    }
+
     function bind() {
         video.onloadedmetadata = function () {
+            applyPlaybackState();
             var p = session && session.playback;
-            if (p && Number(p.selectedIndex) === Number(currentIndex) && Number(p.currentTime) > 1) {
-                try {
-                    video.currentTime = Math.max(0, Number(p.currentTime) - 0.8);
-                } catch (e) {}
+            if (p && Number(p.selectedIndex) === Number(currentIndex)) {
+                seekToSavedPosition();
             }
         };
         video.ontimeupdate = save;
         video.onpause = save;
         video.onplay = save;
+        video.onratechange = save;
+        video.onvolumechange = save;
     }
 
     function hlsErr(e) {
@@ -151,7 +191,8 @@
         msg('m3u8 播放失败：' + det, 3500);
     }
 
-    function play(i) {
+    // resumeOnly=true：会话恢复场景；若会话记录为暂停态则不自动播
+    function play(i, resumeOnly) {
         var d = mediaList[i];
         if (!d) {
             return;
@@ -161,6 +202,9 @@
         render();
         info(d);
         bind();
+        clearTimeout(standbyTimer);
+        standbyTimer = null;
+        var autoplay = !(resumeOnly && shouldResumePaused());
         msg('正在加载投影源 ' + (i + 1) + '...', 1000);
         if (PC.isM3u8(d) && window.Hls && Hls.isSupported()) {
             hlsInstance = new Hls({
@@ -176,18 +220,22 @@
             });
             hlsInstance.on(Hls.Events.MANIFEST_PARSED, function () {
                 msg('');
-                video.play().catch(function () {
-                    msg('浏览器阻止自动播放，请手动点击播放', 2000);
-                });
+                if (autoplay) {
+                    video.play().catch(function () {
+                        msg('浏览器阻止自动播放，请手动点击播放', 2000);
+                    });
+                }
             });
             hlsInstance.on(Hls.Events.ERROR, function (ev, er) { hlsErr(er); });
             return;
         }
         headers(d, function () {
             video.src = d.url;
-            video.play().catch(function () {
-                msg('浏览器阻止自动播放，请手动点击播放', 2000);
-            });
+            if (autoplay) {
+                video.play().catch(function () {
+                    msg('浏览器阻止自动播放，请手动点击播放', 2000);
+                });
+            }
         });
     }
 
@@ -197,6 +245,8 @@
             return;
         }
         isStandby = false;
+        clearTimeout(standbyTimer);
+        standbyTimer = null;
         try {
             chrome.runtime.sendMessage({ Message: 'projector-panel-claim', panelId: panelId, sessionId: session.sessionId }, function () {
                 if (chrome.runtime.lastError) { /* 忽略 */ }
@@ -204,15 +254,43 @@
         } catch (e) {}
     }
 
-    // v11-fix: 让出播放权 —— 先上报当前位置保证接管方无缝续播，再释放播放器（幂等）
+    // v11-方案二：轻量待命 —— 只暂停并停止缓冲，不断开播放器；切回来可秒 resume。
+    // 先上报当前位置保证接管方无缝续播（幂等）。
     function standby() {
         if (isStandby) {
             return;
         }
         try { save(); } catch (e) {}
         isStandby = true;
-        destroy();
+        try { video.pause(); } catch (e) {}
+        try { if (hlsInstance) { hlsInstance.stopLoad(); } } catch (e) {}
+        clearTimeout(standbyTimer);
+        standbyTimer = setTimeout(function () {
+            destroy(); // 长时间待命才彻底释放（防多 tab 内存堆积）
+        }, 5 * 60 * 1000);
         msg('已在其他标签页接管播放', 2500);
+    }
+
+    // v11-方案二：轻量恢复 —— 实例还在，直接续播，无需重建 HLS
+    function resumePlayback() {
+        clearTimeout(standbyTimer);
+        standbyTimer = null;
+        isStandby = false;
+        var p = session && session.playback;
+        var idx = p ? Number(p.selectedIndex) : NaN;
+        if (Number.isFinite(idx) && mediaList[idx] && idx !== currentIndex) {
+            init(session); // 切源了，走完整加载
+            return;
+        }
+        currentIndex = (Number.isFinite(idx) && mediaList[idx]) ? idx : currentIndex;
+        render();
+        applyPlaybackState();
+        seekToSavedPosition();
+        try { if (hlsInstance) { hlsInstance.startLoad(); } } catch (e) {}
+        if (!shouldResumePaused()) {
+            video.play().catch(function () {});
+        }
+        claim();
     }
 
     function init(s) {
@@ -224,7 +302,7 @@
         mediaList = s.list.filter(PC.isProjectorPlayable);
         currentIndex = Math.max(0, Math.min(mediaList.length - 1,
             Number(s.playback && s.playback.selectedIndex !== undefined ? s.playback.selectedIndex : (s.selectedIndex || 0))));
-        play(currentIndex);
+        play(currentIndex, true);
         claim();
     }
 
@@ -237,7 +315,7 @@
         }
     });
 
-    // v11-fix: 文档被缓存复用（如切回旧 tab）时重新接管；可见才播，不可见不抢
+    // v11-方案二：文档被缓存复用（如切回旧 tab）时重新接管；可见才播，不可见不抢
     document.addEventListener('visibilitychange', function () {
         if (document.visibilityState === 'visible' && session && session.sessionId) {
             chrome.runtime.sendMessage({ Message: 'projector-get-session' }, function (r) {
@@ -248,14 +326,47 @@
                 if (s && s.active && String(s.sessionId) === String(session.sessionId)) {
                     session = s;
                     if (isStandby) {
-                        init(s); // 待命过的实例：重新加载并从会话进度续播
+                        if (video.currentSrc) {
+                            resumePlayback(); // 实例还在：轻量续播
+                        } else {
+                            init(s); // 已被彻底释放：完整加载
+                        }
                     } else {
                         claim(); // 断言播放权（幂等）
                     }
+                } else if (s && !s.active) {
+                    isStandby = true;
+                    clearTimeout(standbyTimer);
+                    destroy();
+                    msg('投影会话已结束');
                 }
             });
         }
     });
+
+    // v11-方案二：显式"停止投影"入口 —— 会话结束只由它或新会话覆盖触发，不再随源 tab 关闭
+    (function setupStopButton() {
+        var header = document.getElementById('projectorHeader');
+        if (!header || document.getElementById('projectorStopBtn')) {
+            return;
+        }
+        var b = document.createElement('button');
+        b.id = 'projectorStopBtn';
+        b.className = 'projectorStopBtn';
+        b.textContent = '⏹ 停止';
+        b.title = '停止投影并恢复侧边栏列表';
+        b.addEventListener('click', function () {
+            try {
+                chrome.runtime.sendMessage({ Message: 'projector-close-session' }, function () {});
+            } catch (e) {}
+            try { save(); } catch (e) {}
+            isStandby = true;
+            clearTimeout(standbyTimer);
+            destroy();
+            msg('已停止投影', 2000);
+        });
+        header.appendChild(b);
+    })();
 
     chrome.runtime.sendMessage({ Message: 'projector-get-session' }, function (r) {
         if (chrome.runtime.lastError) {
