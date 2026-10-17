@@ -626,6 +626,12 @@ chrome.runtime.onMessage.addListener(function (Message, sender, sendResponse) {
             return true;
         }
         projectorSaveSession(session);
+        // v11-fix: 上游 tabs.onUpdated 会按 tab 把侧边栏路径重置为 popup.html（列表页）。
+        // 投影打开时必须先把该 tab 的侧边栏固定为 sidepanel.html（播放器）再打开，否则侧边栏显示的是列表。
+        try {
+            chrome.sidePanel.setOptions({ tabId: sourceTabId, path: "sidepanel.html" });
+            chrome.sidePanel.open({ tabId: sourceTabId });
+        } catch (e) { /* 忽略，popup 端会兜底打开 */ }
         sendResponse({ ok: true, sessionId: session.sessionId, count: list.length });
         return true;
     }
@@ -648,8 +654,13 @@ chrome.runtime.onMessage.addListener(function (Message, sender, sendResponse) {
         return true;
     }
     if (Message.Message == "projector-close-session") {
+        const srcTabId = Number(G.ProjectorSession && G.ProjectorSession.sourceTabId) || 0;
         G.ProjectorSession = { active: false, sessionId: "" };
         projectorPersistSession();
+        // v11-fix: 会话结束，把来源 tab 的侧边栏恢复为列表页
+        if (srcTabId > 0) {
+            try { chrome.sidePanel.setOptions({ tabId: srcTabId, path: "popup.html?tabId=" + srcTabId }); } catch (e) {}
+        }
         sendResponse({ ok: true });
         return true;
     }
@@ -736,10 +747,15 @@ chrome.tabs.onUpdated.addListener(function (tabId, changeInfo, tab) {
             G.damnUrlSet.add(tabId);
         }
     }
-    chrome.sidePanel.setOptions({
-        tabId,
-        path: "popup.html?tabId=" + tabId
-    });
+    if (projectorIsActive()) {
+        // v11-fix: 投影会话存续期间，侧边栏固定为播放器，不重置为列表页（v10 行为：全局投影时侧边栏即播放器）
+        chrome.sidePanel.setOptions({ tabId, path: "sidepanel.html" });
+    } else {
+        chrome.sidePanel.setOptions({
+            tabId,
+            path: "popup.html?tabId=" + tabId
+        });
+    }
 });
 
 /**

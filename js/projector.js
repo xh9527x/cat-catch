@@ -54,14 +54,16 @@
             if (chrome.runtime.lastError) {
                 /* 忽略：background 可能尚未就绪 */
             }
+            // v11-fix: 等 background 建好会话并把该 tab 的侧边栏路径设为播放器后，再兜底打开一次（幂等）。
+            // 不能在 sendMessage 之前直接 open，否则会撞上旧的 popup.html 路径导致先闪出列表页。
+            try {
+                chrome.sidePanel.open({ tabId: tabId }, function () {
+                    if (chrome.runtime.lastError) {
+                        /* 忽略 */
+                    }
+                });
+            } catch (e) {}
         });
-        try {
-            chrome.sidePanel.open({ tabId: tabId }, function () {
-                if (chrome.runtime.lastError) {
-                    /* 忽略 */
-                }
-            });
-        } catch (e) {}
     }
 
     function attach(data) {
